@@ -99,6 +99,27 @@ def human(n):
     return "%.1f TiB" % n
 
 
+def human_time(seconds):
+    if not seconds:
+        return "unknown"
+    if seconds < 1:
+        return "<1s"
+    seconds = int(seconds)
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return "%dh%02dm" % (hours, minutes)
+    if minutes:
+        return "%dm%02ds" % (minutes, secs)
+    return "%ds" % secs
+
+
+def rate(num_bytes, seconds):
+    if not seconds or not num_bytes:
+        return "unknown"
+    return "%s/s" % human(num_bytes / seconds)
+
+
 # --------------------------------------------------------------------------
 # env parsing
 # --------------------------------------------------------------------------
@@ -275,17 +296,41 @@ def remote_size(url, token):
     return size
 
 
+def parse_curl_stats(text):
+    """Pull the -w line off curl's stdout: bytes and seconds for this run."""
+    lines = [ln for ln in (text or "").strip().splitlines() if ln.strip()]
+    if not lines:
+        return {}
+    parts = lines[-1].split()
+    if len(parts) != 2:
+        return {}
+    try:
+        return {"bytes": float(parts[0]), "seconds": float(parts[1])}
+    except ValueError:
+        return {}
+
+
 def download(url, dest, token):
     """curl to <dest>.part, then rename. Never leave a truncated real file."""
     part = dest + ".part"
     auth, stdin_data = curl_common(token if is_huggingface(url) else "")
+    stats = {}
 
     def run(resume):
-        cmd = ["curl", "-fL", "--retry", "5", "--retry-all-errors", "--progress-bar"]
+        # curl's *default* progress meter, not --progress-bar: the plain bar
+        # shows a percentage and nothing else, which tells you nothing useful
+        # when a 24 GB file is crawling. The default meter has live speed and
+        # ETA. It goes to stderr; the -w summary comes back on stdout.
+        cmd = ["curl", "-fL", "--retry", "5", "--retry-all-errors",
+               "-w", "%{size_download} %{time_total}\n"]
         if resume:
             cmd += ["-C", "-"]
         cmd += auth + ["-o", part, "--", url]
-        return subprocess.run(cmd, input=stdin_data, universal_newlines=True).returncode
+        proc = subprocess.run(cmd, input=stdin_data, stdout=subprocess.PIPE,
+                              universal_newlines=True)
+        if proc.returncode == 0:
+            stats.update(parse_curl_stats(proc.stdout))
+        return proc.returncode
 
     rc = run(resume=os.path.exists(part))
     # 33: server has no ranged-request support. 36: bad resume offset.
@@ -305,7 +350,12 @@ def download(url, dest, token):
         return None
 
     os.replace(part, dest)
-    return os.path.getsize(dest)
+    return {
+        "size": os.path.getsize(dest),
+        # Bytes moved *this run* — smaller than size when a .part was resumed.
+        "bytes": stats.get("bytes"),
+        "seconds": stats.get("seconds"),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -399,6 +449,7 @@ def main():
 
     manifest = load_manifest(manifest_path)
     downloaded = skipped = failed = 0
+    total_bytes = total_seconds = 0.0
     failures = []
     seen = set()
 
@@ -422,8 +473,8 @@ def main():
 
         log("download %s" % key)
         log("         <- %s" % url)
-        size = download(url, path, token)
-        if size is None:
+        result = download(url, path, token)
+        if result is None:
             failed += 1
             failures.append(key)
             if url.startswith(GATED_URL_PREFIXES):
@@ -431,10 +482,18 @@ def main():
                     % FLUX_LICENCE_URL)
             continue
 
+        size = result["size"]
         manifest[key] = {"url": url, "size": size}
         save_manifest(manifest_path, manifest)
         downloaded += 1
-        log("         ok, %s" % human(size))
+        moved, secs = result["bytes"], result["seconds"]
+        if moved and secs:
+            total_bytes += moved
+            total_seconds += secs
+            log("         ok, %s in %s (%s average)"
+                % (human(size), human_time(secs), rate(moved, secs)))
+        else:
+            log("         ok, %s" % human(size))
 
     if env_bool("PRUNE_LORAS", False):
         wanted = set("loras/%s" % name for _, name, _ in loras)
@@ -444,6 +503,10 @@ def main():
     log()
     log("-" * 60)
     log("downloaded %d   skipped %d   failed %d" % (downloaded, skipped, failed))
+    if total_bytes and total_seconds:
+        log("transferred %s in %s (%s average)"
+            % (human(total_bytes), human_time(total_seconds),
+               rate(total_bytes, total_seconds)))
     for key in failures:
         log("  FAILED: %s" % key)
     try:
