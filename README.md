@@ -37,6 +37,16 @@ So adding one line to `LORAS` fetches exactly that one file. Downloads go to
 `.part` and are renamed on success, so an interrupted pod won't leave a
 truncated file that looks valid — and `curl -C -` resumes it.
 
+Before any download it checks free space against the remote size and refuses
+to start if it can't fit, rather than filling the volume and dying at 60%.
+Permanent failures (401/403/404, out of disk) fail immediately with a single
+explanatory line instead of five pointless retries, and their dead `.part`
+files are cleaned up so the wasted space doesn't compound across reboots.
+
+If a file on the volume is the wrong size and there isn't room for both
+copies, the old one is deleted first — it's provably wrong and about to be
+replaced, and keeping it is what turns a corrupt model into a boot loop.
+
 ## Setup
 
 ### 1. Build the image

@@ -43,9 +43,9 @@ MODEL_EXTS = (
     ".onnx",
 )
 
-FLUX_LICENCE_URL = "https://huggingface.co/black-forest-labs/FLUX.1-dev"
+LICENCE_URL = "https://huggingface.co/black-forest-labs/FLUX.1-dev"
 
-# subdir, filename, url
+# subdir, filename, url — the full fp16 stack, ~34 GB.
 BASE_MODELS = (
     (
         "diffusion_models",
@@ -71,6 +71,10 @@ BASE_MODELS = (
 
 # Repos that need HF_TOKEN because the licence is click-through gated.
 GATED_URL_PREFIXES = ("https://huggingface.co/black-forest-labs/FLUX.1-dev",)
+
+# Leave the volume a little room so a full disk doesn't also break ComfyUI's
+# own writes (outputs, user settings, Manager installs).
+FREE_SPACE_MARGIN = 512 * 1024 * 1024
 
 
 def log(msg=""):
@@ -118,6 +122,13 @@ def rate(num_bytes, seconds):
     if not seconds or not num_bytes:
         return "unknown"
     return "%s/s" % human(num_bytes / seconds)
+
+
+def free_space(path):
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -297,15 +308,16 @@ def remote_size(url, token):
 
 
 def parse_curl_stats(text):
-    """Pull the -w line off curl's stdout: bytes and seconds for this run."""
+    """Pull the -w line off curl's stdout: http code, bytes, seconds."""
     lines = [ln for ln in (text or "").strip().splitlines() if ln.strip()]
     if not lines:
         return {}
     parts = lines[-1].split()
-    if len(parts) != 2:
+    if len(parts) != 3:
         return {}
     try:
-        return {"bytes": float(parts[0]), "seconds": float(parts[1])}
+        return {"code": int(parts[0]), "bytes": float(parts[1]),
+                "seconds": float(parts[2])}
     except ValueError:
         return {}
 
@@ -321,29 +333,30 @@ def download(url, dest, token):
         # shows a percentage and nothing else, which tells you nothing useful
         # when a 24 GB file is crawling. The default meter has live speed and
         # ETA. It goes to stderr; the -w summary comes back on stdout.
-        cmd = ["curl", "-fL", "--retry", "5", "--retry-all-errors",
-               "-w", "%{size_download} %{time_total}\n"]
+        #
+        # Plain --retry, NOT --retry-all-errors: the latter retries permanent
+        # failures too, so a 403 or a full disk burns five attempts and ~30s
+        # of backoff while burying the real cause in warnings. Bare --retry
+        # covers only what is actually transient (timeouts, 408, 429, 5xx).
+        cmd = ["curl", "-fL", "--retry", "5", "--retry-connrefused",
+               "-w", "%{http_code} %{size_download} %{time_total}\n"]
         if resume:
             cmd += ["-C", "-"]
         cmd += auth + ["-o", part, "--", url]
         proc = subprocess.run(cmd, input=stdin_data, stdout=subprocess.PIPE,
                               universal_newlines=True)
-        if proc.returncode == 0:
-            stats.update(parse_curl_stats(proc.stdout))
+        stats.update(parse_curl_stats(proc.stdout))
         return proc.returncode
 
     rc = run(resume=os.path.exists(part))
     # 33: server has no ranged-request support. 36: bad resume offset.
     if rc in (33, 36) and os.path.exists(part):
-        log("resume rejected by the server, restarting this file from zero")
-        try:
-            os.remove(part)
-        except OSError:
-            pass
+        log("         resume rejected by the server, restarting from zero")
+        remove_quietly(part)
         rc = run(resume=False)
 
     if rc != 0:
-        log("ERROR: curl exited %d for %s" % (rc, url))
+        explain_failure(rc, stats.get("code"), url, part)
         return None
     if not os.path.exists(part):
         log("ERROR: curl reported success but wrote nothing for %s" % url)
@@ -358,41 +371,129 @@ def download(url, dest, token):
     }
 
 
+def remove_quietly(path):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            return True
+    except OSError as exc:
+        log("WARNING: could not remove %s: %s" % (path, exc))
+    return False
+
+
+def explain_failure(rc, http_code, url, part):
+    """Say what actually went wrong, in one line, instead of retry noise."""
+    if rc == 23:
+        # Write error. On a network volume this is essentially always ENOSPC.
+        log("ERROR: out of disk space while writing this file.")
+        if remove_quietly(part):
+            log("       removed the partial download to free the space back.")
+        log("       Grow the network volume, or delete something under "
+            "$MODELS_DIR, then restart.")
+        return
+
+    if http_code in (401, 403):
+        log("ERROR: HTTP %s — authorised but not permitted." % http_code)
+        log("       This repo is gated. Accept the licence at %s while logged"
+            % LICENCE_URL)
+        log("       in as the account owning HF_TOKEN, and make sure the token")
+        log("       is a classic Read token (fine-grained tokens need the")
+        log("       'public gated repos' scope ticked explicitly).")
+        log("       Check which account it is:")
+        log("         curl -s -H \"Authorization: Bearer $HF_TOKEN\" "
+            "https://huggingface.co/api/whoami-v2")
+        # A permanent failure will never resume; don't hoard the bytes.
+        remove_quietly(part)
+        return
+
+    if http_code == 404:
+        log("ERROR: HTTP 404 — no such file. Check the URL: %s" % url)
+        remove_quietly(part)
+        return
+
+    if http_code and http_code >= 400:
+        log("ERROR: HTTP %s for %s" % (http_code, url))
+        return
+
+    log("ERROR: curl exited %d for %s" % (rc, url))
+
+
 # --------------------------------------------------------------------------
 # planning
 # --------------------------------------------------------------------------
 
 def plan_file(key, path, url, manifest, token, force, skip_size_check):
-    """Decide what to do with one file. Returns 'download' or 'skip'."""
+    """Decide what to do with one file.
+
+    Returns (action, remote_size) where action is 'download' or 'skip'.
+    """
     if force:
-        return "download"
+        return "download", None
 
     if not os.path.exists(path):
-        return "download"
+        return "download", None
 
     local_size = os.path.getsize(path)
     record = manifest.get(key)
 
     # Known file, unchanged config: the fast path — no network call at all.
     if record and record.get("url") == url and record.get("size") == local_size:
-        return "skip"
+        return "skip", None
 
     if skip_size_check:
         manifest[key] = {"url": url, "size": local_size}
-        return "skip"
+        return "skip", None
 
     remote = remote_size(url, token)
     if remote is None:
         # Can't tell. Trust what's on disk rather than burn 24 GB of transfer.
         log("  %s: remote size unknown, keeping the local file" % key)
-        return "skip"
+        return "skip", None
     if remote == local_size:
         manifest[key] = {"url": url, "size": local_size}
-        return "skip"
+        return "skip", None
 
     log("  %s: local %s vs remote %s — re-downloading"
         % (key, human(local_size), human(remote)))
-    return "download"
+    return "download", remote
+
+
+def ensure_room(path, url, token, remote):
+    """Refuse to start a download that cannot possibly fit.
+
+    Filling the volume and dying at 60% is the worst outcome: the dead .part
+    keeps the space, so every later boot retries and fails a bit faster. If
+    the file already on disk is provably the wrong size and there is no room
+    for both, drop it first — we have already decided to replace it.
+    """
+    if remote is None:
+        remote = remote_size(url, token)
+    if remote is None:
+        return True  # unknown size; let curl try
+
+    avail = free_space(os.path.dirname(path))
+    if avail is None:
+        return True
+
+    need = remote + FREE_SPACE_MARGIN
+    if avail >= need:
+        return True
+
+    if os.path.exists(path):
+        stale = os.path.getsize(path)
+        log("         not enough room for both copies (%s free, needs %s)"
+            % (human(avail), human(need)))
+        log("         the local copy is the wrong size, so removing it first")
+        if remove_quietly(path):
+            avail = free_space(os.path.dirname(path)) or 0
+            if avail >= need:
+                return True
+            log("         still short after freeing %s" % human(stale))
+
+    log("ERROR: not enough free space. Need %s, have %s."
+        % (human(need), human(avail)))
+    log("       Grow the network volume or delete something under $MODELS_DIR.")
+    return False
 
 
 def prune_loras(models_dir, manifest, wanted_keys):
@@ -442,8 +543,9 @@ def main():
         log("!" * 70)
         log("HF_TOKEN is empty. flux1-dev.safetensors and ae.safetensors live in")
         log("a gated repo and will 401 without it.")
-        log("Accept the licence at %s, create a read token, and set HF_TOKEN as a" % FLUX_LICENCE_URL)
-        log("RunPod Secret. Carrying on regardless — the ungated files will work.")
+        log("Accept the licence at %s, create a classic Read token, and set" % LICENCE_URL)
+        log("HF_TOKEN as a RunPod Secret. Carrying on — the ungated text encoders")
+        log("will still download.")
         log("!" * 70)
         log()
 
@@ -464,7 +566,8 @@ def main():
         os.makedirs(dest_dir, exist_ok=True)
         path = os.path.join(dest_dir, filename)
 
-        action = plan_file(key, path, url, manifest, token, force, skip_size_check)
+        action, remote = plan_file(key, path, url, manifest, token, force,
+                                   skip_size_check)
         if action == "skip":
             skipped += 1
             log("skip     %s" % key)
@@ -473,13 +576,15 @@ def main():
 
         log("download %s" % key)
         log("         <- %s" % url)
+        if not ensure_room(path, url, token, remote):
+            failed += 1
+            failures.append(key)
+            continue
+
         result = download(url, path, token)
         if result is None:
             failed += 1
             failures.append(key)
-            if url.startswith(GATED_URL_PREFIXES):
-                log("         (gated repo — check HF_TOKEN and the licence at %s)"
-                    % FLUX_LICENCE_URL)
             continue
 
         size = result["size"]
@@ -509,11 +614,13 @@ def main():
                rate(total_bytes, total_seconds)))
     for key in failures:
         log("  FAILED: %s" % key)
-    try:
-        usage = shutil.disk_usage(models_dir)
-        log("volume: %s free of %s" % (human(usage.free), human(usage.total)))
-    except OSError as exc:
-        log("could not stat the volume: %s" % exc)
+    avail = free_space(models_dir)
+    if avail is not None:
+        try:
+            total = shutil.disk_usage(models_dir).total
+            log("volume: %s free of %s" % (human(avail), human(total)))
+        except OSError:
+            log("volume: %s free" % human(avail))
     log("-" * 60)
 
     # Never block ComfyUI from starting: a missing LoRA is a broken node,
