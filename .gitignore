@@ -1,0 +1,32 @@
+# model weights never belong in git
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.sft
+*.gguf
+*.onnx
+
+# interrupted downloads
+*.part
+
+# secrets — .env.example is the tracked one
+.env
+.env.local
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# the build prompt — local working doc, and it names a private LoRA URL
+CLAUDE_CODE_PROMPT.md
+
+# runtime junk
+models/
+output/
+input/
+.provision-manifest.json
+.DS_Store
