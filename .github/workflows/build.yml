@@ -1,0 +1,66 @@
+name: build image
+
+# Builds the RunPod template image on GitHub's amd64 runners and publishes it to
+# GHCR. Doing it here rather than locally matters if you are on Apple Silicon:
+# a local `docker build --platform linux/amd64` runs the torch install under
+# qemu emulation and takes the better part of an hour.
+
+on:
+  push:
+    branches: [main]
+    # Docs are excluded from the image by .dockerignore, so they cannot change it.
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # torch + cu128 + ComfyUI's deps land around 10 GB and the hosted runner
+      # ships with ~14 GB free. Reclaiming the preinstalled toolchains avoids a
+      # late ENOSPC.
+      - name: Free up runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Where it landed
+        run: |
+          echo "::notice::ghcr.io/${{ github.repository }}:latest"
+          echo "Make the package PUBLIC once, or RunPod cannot pull it:"
+          echo "https://github.com/${{ github.repository }}/pkgs/container/${{ github.event.repository.name }}"

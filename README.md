@@ -6,6 +6,7 @@ re-download 35 GB.
 
 ```
 Dockerfile                        image for the RunPod template
+.github/workflows/build.yml       CI build + publish to GHCR
 scripts/entrypoint.sh             wires ComfyUI to the volume, then launches
 scripts/provision.py              idempotent downloader (models + LoRAs)
 scripts/bootstrap.sh              alternative: no Docker build, Start command only
@@ -13,6 +14,7 @@ workflows/flux_dev_power_lora.json    Flux + rgthree Power Lora Loader
 workflows/flux_dev_lora_chain.json    Flux + 3 stock LoraLoaderModelOnly nodes
 tools/gen_workflows.py            regenerates + validates those two graphs
 .env.example                      every env var, documented
+Makefile                          make check / build / run / workflows
 ```
 
 No LoRA is baked into the image or the workflows — they ship with empty
@@ -37,15 +39,19 @@ truncated file that looks valid — and `curl -C -` resumes it.
 
 ## Setup
 
-### 1. Build and push the image
+### 1. Build the image
 
-```bash
-docker build -t youruser/flux-comfyui:latest .
-docker push youruser/flux-comfyui:latest
-```
+Push to `main` (or run the **build image** workflow by hand) and GitHub Actions
+publishes `ghcr.io/dimitar-stanevv/flux1dev:latest`. Nothing to run locally.
 
-Build on an x86 machine (or `--platform linux/amd64`). The image is ~9 GB;
-model weights are deliberately *not* baked in.
+**Make the package public once**, or RunPod can't pull it — the package page is
+linked from the workflow's summary, under *Package settings → Change visibility*.
+
+> Build in CI rather than locally on Apple Silicon: `--platform linux/amd64`
+> runs the torch install under qemu emulation and takes roughly an hour.
+> `make build` is there for Linux hosts.
+
+The image is ~9 GB; model weights are deliberately *not* baked in.
 
 ### 2. Create the network volume
 
@@ -69,7 +75,7 @@ Matching the fields in the Create template dialog:
 | Template name | `flux1dev` |
 | Template type | Pods |
 | Compute type | NVIDIA GPU |
-| Container image | `youruser/flux-comfyui:latest` |
+| Container image | `ghcr.io/dimitar-stanevv/flux1dev:latest` |
 | Start command | *(leave empty — the image has a CMD)* |
 | Container disk | **20 GB** (5 is too small for the venv + torch) |
 | Persistent storage / Volume disk | 0 — the network volume overrides this |
@@ -178,7 +184,7 @@ If you'd rather not maintain an image: push this repo to GitHub, use a stock
 RunPod PyTorch image with CUDA 12.8, and set the Start command to
 
 ```
-bash -c "curl -fsSL https://raw.githubusercontent.com/you/flux-comfyui-runpod/main/scripts/bootstrap.sh | bash"
+bash -c "curl -fsSL https://raw.githubusercontent.com/dimitar-stanevv/flux1dev/main/scripts/bootstrap.sh | bash"
 ```
 
 with `REPO_URL` set in the env. It installs ComfyUI, the venv and the models

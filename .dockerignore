@@ -1,0 +1,12 @@
+.git
+.github
+.env
+docs/
+*.md
+!README.md
+tools/
+__pycache__/
+*.pyc
+.DS_Store
+*.safetensors
+*.part

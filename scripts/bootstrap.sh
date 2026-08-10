@@ -3,7 +3,7 @@
 # image with CUDA 12.8. It installs ComfyUI, a venv and the models onto the
 # network volume, so only the first boot is slow.
 #
-#   bash -c "curl -fsSL https://raw.githubusercontent.com/<you>/<repo>/main/scripts/bootstrap.sh | bash"
+#   bash -c "curl -fsSL https://raw.githubusercontent.com/dimitar-stanevv/flux1dev/main/scripts/bootstrap.sh | bash"
 #
 # Trade-off vs the Dockerfile: pip gets re-checked on every start, and a bad
 # commit on main breaks every pod immediately. The image is the safer route.
